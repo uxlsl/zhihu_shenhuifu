@@ -5,7 +5,6 @@ from __future__ import print_function
 import gevent.monkey
 gevent.monkey.patch_socket()
 
-import json
 import gzip
 import cStringIO
 from bs4 import BeautifulSoup
@@ -14,9 +13,22 @@ import urllib2
 import gevent
 from gevent.queue import Queue, Empty
 from gevent.event import Event
+from jinja2 import Template
+import operator
+
 
 questions_queue = Queue(maxsize=100)
 is_end = Event()
+TEMPLATE = u"""
+# 知乎神回复
+爬取了知乎2万个问题，选择最有可能是神回复的前1000个
+计算公式：score =vote/(5+answer_len^2/10)
+{% for item in questions %}
+## [{{ item[1] }}]({{ item[5] }}) 得分:{{ item[6] }}
+{{ item[2] }}
+{% endfor %}
+
+"""
 
 
 class NotAnswer(Exception):
@@ -26,6 +38,10 @@ class NotAnswer(Exception):
 def formatStr(s):
     s = s.replace('\n', ' ').replace('\t', ' ')
     return s.strip()
+
+
+def eval_score(i):
+    return 1.0 * i[4] / (5 + (i[3] ** 2) / 10)
 
 
 def getArticle(qid):
@@ -38,16 +54,16 @@ def getArticle(qid):
     if item is None:
         raise NotAnswer("not answer {}".format(url))
     anwser = item.find(
-        'div', {'class': 'zm-editable-content clearfix'}).get_text().strip()
-    vote = item.find(
-        'div', {'class': 'zm-item-vote-info'}).get('data-votecount').strip()
+        'div', {'class': 'zm-editable-content clearfix'}).prettify()
+    vote = int(item.find(
+        'div', {'class': 'zm-item-vote-info'}).get('data-votecount').strip())
     anwser = formatStr(anwser)
     ans_len = len(anwser)
-    if ans_len > 100:
-        anwser = anwser[0:100]
     title = formatStr(title)
-    out = [qid, title, anwser.encode('utf-8'),
-           str(ans_len), vote, url]
+    out = [qid, title.decode('utf-8'), anwser,
+           ans_len, vote, url]
+    score = eval_score(out)
+    out.append(score)
     return out
 
 
@@ -92,6 +108,8 @@ def get_questions_worker(lastId, max_question=10000):
     total = 0
     while True:
         ques, lastId = getQuestions(lastId)
+        if not ques:
+            break
         for i in ques:
             print('put work {}'.format(i))
             questions_queue.put(i)
@@ -101,15 +119,16 @@ def get_questions_worker(lastId, max_question=10000):
                 return
 
 
-def question_desc_worker(wf):
+def question_desc_worker(out):
     """问题祥情获取并进行处理,这里是可以多个
     """
-    while not is_end.is_set():
+    while not (is_end.is_set() and questions_queue.empty()):
         try:
             qid = questions_queue.get(timeout=120)
             print('get work {}'.format(qid))
-            out = getArticle(qid)
-            wf.write(json.dumps(out) + '\n')
+            article = getArticle(qid)
+            if article[4] != 0:
+                out.append(article)
         except NotAnswer as e:
             print(e)
         except Empty:
@@ -120,17 +139,22 @@ def question_desc_worker(wf):
 
 def craw():
     lastId = '389059437'
-    wf = open('zhihu.txt', 'a+')
+    output = 'zhihu.md'
+    max_question = 1000000
+    out = []
     gevent.joinall(
         [
-            gevent.spawn(get_questions_worker, lastId),
-            gevent.spawn(question_desc_worker, wf),
-            gevent.spawn(question_desc_worker, wf),
-            gevent.spawn(question_desc_worker, wf),
+            gevent.spawn(get_questions_worker, lastId, max_question),
+            gevent.spawn(question_desc_worker, out),
+            gevent.spawn(question_desc_worker, out),
+            gevent.spawn(question_desc_worker, out),
         ]
     )
-    wf.close()
-
+    print(len(out))
+    out = sorted(out, key=operator.itemgetter(6), reverse=True)
+    template = Template(TEMPLATE)
+    content = template.render(questions=out[:100])
+    open(output, 'w').write(content.encode('utf-8'))
 
 if __name__ == '__main__':
     craw()
