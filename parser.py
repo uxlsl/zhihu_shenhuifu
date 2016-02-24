@@ -1,12 +1,22 @@
 #!encoding=utf-8
+
 from __future__ import print_function
+
+import gevent.monkey
+gevent.monkey.patch_socket()
+
 import json
 import gzip
 import cStringIO
 from bs4 import BeautifulSoup
 import urllib
 import urllib2
-import requests
+import gevent
+from gevent.queue import Queue, Empty
+from gevent.event import Event
+
+questions_queue = Queue(maxsize=100)
+is_end = Event()
 
 
 class NotAnswer(Exception):
@@ -18,9 +28,9 @@ def formatStr(s):
     return s.strip()
 
 
-def getArticle(url):
-    print("getArticle {}".format(url))
-    page = requests.get(url, timeout=120).content
+def getArticle(qid):
+    url = 'http://www.zhihu.com/question/' + qid
+    page = urllib2.urlopen(url, timeout=120).read()
     pageSoup = BeautifulSoup(page, 'lxml')
     title = str(pageSoup.title).replace(
         '<title>', '').replace('</title>', '').strip()
@@ -36,7 +46,7 @@ def getArticle(url):
     if ans_len > 100:
         anwser = anwser[0:100]
     title = formatStr(title)
-    out = [title, anwser.encode('utf-8'),
+    out = [qid, title, anwser.encode('utf-8'),
            str(ans_len), vote, url]
     return out
 
@@ -72,26 +82,55 @@ def getQuestions(start, offset='20'):
             0].get('href').rsplit('/', 1)[1]
         questions.append(url)
     lastId = items[-1].get('id').split('-')[1]
-    print(questions, lastId)
     return questions, lastId
 
 
-def craw():
-    wf = open('zhihu.txt', 'a+')
-    domain = 'http://www.zhihu.com/question/'
-    lastId = '389059437'
-    for i in xrange(10000):
-        print (i, lastId)
+def get_questions_worker(lastId, max_question=10000):
+    """
+    获取问题的IDS,并放时队列让问题祥情worker处理
+    """
+    total = 0
+    while True:
         ques, lastId = getQuestions(lastId)
-        for q in ques:
-            try:
-                out = getArticle(domain + q)
-                wf.write(json.dumps(out) + '\n')
-            except NotAnswer as e:
-                print(e)
-            except requests.Timeout as e:
-                pass
+        for i in ques:
+            print('put work {}'.format(i))
+            questions_queue.put(i)
+            total += 1
+            if total > max_question:
+                is_end.set()
+                return
 
+
+def question_desc_worker(wf):
+    """问题祥情获取并进行处理,这里是可以多个
+    """
+    while not is_end.is_set():
+        try:
+            qid = questions_queue.get(timeout=120)
+            print('get work {}'.format(qid))
+            out = getArticle(qid)
+            wf.write(json.dumps(out) + '\n')
+        except NotAnswer as e:
+            print(e)
+        except Empty:
+            gevent.sleep(5)
+        except urllib2.URLError:
+            gevent.sleep(5)
+
+
+def craw():
+    lastId = '389059437'
+    wf = open('zhihu.txt', 'a+')
+    gevent.joinall(
+        [
+            gevent.spawn(get_questions_worker, lastId),
+            gevent.spawn(question_desc_worker, wf),
+            gevent.spawn(question_desc_worker, wf),
+            gevent.spawn(question_desc_worker, wf),
+        ]
+    )
     wf.close()
+
+
 if __name__ == '__main__':
     craw()
