@@ -135,6 +135,10 @@ def question_desc_worker(out):
             gevent.sleep(5)
         except urllib2.URLError:
             gevent.sleep(5)
+        except Exception as e:
+            gevent.sleep(5)
+            print(type(e))
+            print(e)
 
 
 def craw():
